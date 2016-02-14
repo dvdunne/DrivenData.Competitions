@@ -1,0 +1,357 @@
+---
+title: "Predicting Blood Donations Project"
+author: "Dave Dunne"
+date: "February 10, 2016"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r, echo=FALSE}
+# Here the libraries loaded dynamically by caret are preloaded 
+suppressMessages(library(rpart))
+suppressMessages(library(ggplot2))
+suppressMessages(library(MASS)) 
+suppressMessages(library(kernlab))
+suppressMessages(library(randomForest)) 
+suppressMessages(library(splines)) 
+suppressMessages(library(plyr)) 
+suppressMessages(library(C50)) 
+suppressMessages(library(gbm)) 
+```
+
+For machine learning practice, I decided to run through a project from the [Driven Data](http://www.drivendata.org/) competition website. Specifically, I worked on the "Predict Blood Donations" competitions which is from their *warm up* colection and contains a simple dataset from the [ UCI Machine Learning repository](https://archive.ics.uci.edu/ml/datasets/Blood+Transfusion+Service+Center).
+
+## Getting Started
+
+To get started, I load in the following packages.
+
+```{r, warning=FALSE, message=FALSE}
+# Load packages
+library(readr)
+library(caret)
+library(dplyr)
+library(car)
+```
+
+Next I load in the data and rename a few features (mainly so they fit on the HTML page here).
+```{r, cache=TRUE}
+# Load data
+raw.data <- read_csv("data/dd-train.csv")
+names(raw.data) <- make.names(names(raw.data))  # Make names more R friendly
+colnames(raw.data)[1] <- "id" # rename the column that has the ID
+colnames(raw.data)[6] <- "Class"  # rename the column that has our class (to make it fit on the page)
+```
+
+
+Next I split the test data into a train and validation set
+```{r}
+# Split data into train set and validation set (80:20 slit)
+set.seed(7)
+validationIndex <- createDataPartition(raw.data$Class, p=0.80, list=FALSE)
+validation.set <- raw.data[-validationIndex,]
+train.set <- raw.data[validationIndex,]
+```
+
+
+## Exploring The Data
+
+Let's first take a look at some summary statistics.
+
+```{r}
+dim(train.set)
+summary(train.set)
+```
+
+### Visualization
+
+It would be a good idea to visualize the data so we can get a better idea on what the data looks like. We will use the base graphics for the most part since we want something quick and dirty. There is no need to go for fancy graphics here.
+
+```{r, echo=FALSE}
+train.set <- as.data.frame(sapply(train.set, as.numeric )) # convert to numeric for plotting
+```
+
+```{r, fig.width=12}
+par(mfrow=c(2,2))
+for(i in 2:5) {
+  hist(train.set[,i], main=names(train.set)[i])
+}
+```
+
+```{r, fig.width=12}
+par(mfrow=c(2,2))
+for(i in 2:5) {
+  plot(density(train.set[,i]), main=names(train.set)[i])
+}
+```
+
+```{r, fig.width=12}
+jittered_x <- sapply(train.set[,2:5], jitter)
+pairs(jittered_x, names(train.set[,2:5]), col=(train.set$Class)+1)
+```
+
+
+## Cleaning Up
+
+It is a good idea to see if any of the features are corrolated since highly corrolated features may affect our final model perfomance.
+
+```{r}
+cor(train.set[,2:5])  # Check for correlations
+```
+
+So here we see that `Number.of.Donations` correlates with `Total.Volume.Donated..c.c..` which makes sense so let's remove the total volume feature.
+
+```{r}
+train.set$Total.Volume.Donated..c.c.. <- NULL # remove correlated column
+```
+
+### Feature Engineering
+
+I have decided to create two new variables. One which counts the number of donations per month and one for the ratio of last to first donation months.
+
+```{r}
+train.set <- train.set %>% mutate(donations.per.month = Number.of.Donations/Months.since.First.Donation)
+train.set <- train.set %>% mutate(tenure.ratio = Months.since.Last.Donation/Months.since.First.Donation)
+```
+
+
+### Final Clean Up
+
+This competition required that the submission use class probabilities so we will change our required class to be a factor of Yes/No.
+
+```{r}
+#Recode the class labels to Yes/No (required when using class probs)
+required.labels <- train.set['Class']
+recoded.labels <- recode(required.labels$Class, "0='No'; 1 = 'Yes'")
+train.set$Class <- recoded.labels
+train.set$Class  <-as.factor(train.set$Class) # Make the class variable a factor
+```
+
+Lastly I remove the ID coumn since we won't use this when creating the model.
+
+```{r}
+train.set$id <- NULL  #Remove id column
+```
+
+Now we are ready to start investigating some models.
+
+## Model Baselines
+
+First we set up our test harness where we will do 10 fold cross validation with 3 repeats. Also, since this competition is being judged on logLoss we set that up as our metric.
+
+```{r}
+# 10-fold cross validation with 3 repeats
+trainControl <- trainControl(method="repeatedcv", summaryFunction=mnLogLoss, number=10, repeats=3, 
+                             classProbs=TRUE)
+metric <- "logLoss"
+```
+
+As a start we will train using Logistic Regression (glm), Linear Discriminate Analysis (lda), Regularized Logistic Regression (glmnet), Classification and Regressikon Trees (rpart), and Support Vector Machines with Radial Basis Functions (svmRadial) using the caret package.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+set.seed(7)
+fit.glm <- train(Class~., data=train.set, method="glm", metric=metric, trControl=trainControl) # GLM
+
+set.seed(7)
+fit.lda <- train(Class~., data=train.set, method="lda", metric=metric, trControl=trainControl) # LDA
+
+set.seed(7)
+fit.glmnet <- train(Class~., data=train.set, method="glmnet", metric=metric,trControl=trainControl)  # GLMNET
+
+set.seed(7)
+fit.cart <- train(Class~., data=train.set, method="rpart", metric=metric,trControl=trainControl)  # CART
+
+set.seed(7)
+fit.svm <- train(Class~., data=train.set, method="svmRadial", metric=metric, trControl=trainControl)  # SVM
+```
+
+Now let's compare the performance of the algoritms.
+
+```{r, , results='hold', fig.width=12}
+# Compare algorithms
+results <- resamples(list(LG=fit.glm, LDA=fit.lda, GLMNET=fit.glmnet, CART=fit.cart, SVM=fit.svm))
+summary(results)
+dotplot(results)
+```
+
+The objective here is to minimize the logLoss so Logistic Regression, Linear Discriminate Analysis and Regularized Logistic Regression appear to perform best in this baseline with GLMNET having the best performance (by a very small margin).
+
+### Using the Box Cox Transformation
+
+We saw earlier that there was some skewness in the data so let's see if a Box Cox transformation will help. 
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, results='hold', fig.width=12}
+preProcess="BoxCox"  # pre prcess with a Box Cox transformation 
+# 10-fold cross validation with 3 repeats
+trainControl <- trainControl(method="repeatedcv", summaryFunction=mnLogLoss, number=10, repeats=3, 
+                             classProbs=TRUE)
+metric <- "logLoss"
+
+set.seed(7)
+fit.glm <- train(Class~., data=train.set, method="glm", metric=metric, trControl=trainControl, preProc=preProcess) # GLM
+
+set.seed(7)
+fit.lda <- train(Class~., data=train.set, method="lda", metric=metric, trControl=trainControl, preProc=preProcess) # LDA
+
+set.seed(7)
+fit.glmnet <- train(Class~., data=train.set, method="glmnet", metric=metric,trControl=trainControl, preProc=preProcess)  # GLMNET
+
+set.seed(7)
+fit.cart <- train(Class~., data=train.set, method="rpart", metric=metric,trControl=trainControl, preProc=preProcess)  # CART
+
+set.seed(7)
+fit.svm <- train(Class~., data=train.set, method="svmRadial", metric=metric, trControl=trainControl, preProc=preProcess)  # SVM
+
+# Compare algorithms
+results <- resamples(list(LG=fit.glm, LDA=fit.lda, GLMNET=fit.glmnet, CART=fit.cart, SVM=fit.svm))
+summary(results)
+dotplot(results)
+```
+
+Here we see a slight improvement in the scores for GLM, LDA and GLMNET with GLMNET once again having the best performance (barely). 
+
+But next, let's try some ensemble methods to see if they are better.
+
+## Ensemble Methods
+
+The methods we will try are Random Forest, Stochastic Gradient Boosting and C5.0 and we will use the same training control as before.
+
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, results='hold', fig.width=12}
+# 10-fold cross validation with 3 repeats
+trainControl <- trainControl(method="repeatedcv", summaryFunction=mnLogLoss, number=10, repeats=3, 
+                             classProbs=TRUE)
+metric <- "logLoss"
+preProcess = "BoxCox"
+
+set.seed(7)
+fit.rf <- train(Class~., data=train.set, method="rf", metric=metric, preProc=preProcess,
+                trControl=trainControl)  # Random Forest
+
+set.seed(7)
+fit.gbm <- train(Class~., data=train.set, method="gbm", metric=metric, preProc=preProcess,
+                 trControl=trainControl, verbose=FALSE)  # Stochastic Gradient Boosting
+
+set.seed(7)
+fit.c50 <- train(Class~., data=train.set, method="C5.0", metric=metric, preProc=preProcess,
+                 trControl=trainControl)  # C5.0
+
+# Compare results
+ensembleResults <- resamples(list(RF=fit.rf, GBM=fit.gbm, C50=fit.c50))
+summary(ensembleResults)
+dotplot(ensembleResults)
+```
+
+The performance of GBM is the best ensemble method here and is close to the GLMNET algorithm.
+
+But from now on, we will just concentrate on the GLMNET algorithm since it is a little faster to run.
+
+## Tuning Regularized Logistic Regression
+
+To see if we can squeeze a little bit more performance out of the GLMNET, we will tweak the mixing percentage (alpha) and regularization parameter (lambda) and see what happens.
+
+```{r, warning=FALSE, message=FALSE, results='hide'}
+
+preProcess="BoxCox"
+
+# 10-fold cross validation with 3 repeats
+trainControl <- trainControl(method="repeatedcv", summaryFunction=mnLogLoss, number=10, repeats=3, 
+                            classProbs=TRUE)
+metric <- "logLoss"
+
+set.seed(7)
+grid <- expand.grid(alpha=c((70:100)/100), lambda = c(0.001, 0.0009, 0.0008,0.0007))
+fit.glmnet <- train(Class~., data=train.set, method="glmnet", metric=metric, tuneGrid=grid,
+                 preProc=preProcess, trControl=trainControl)
+
+```
+
+```{r, fig.width=12}
+plot(fit.glmnet)
+best.aplha <- fit.glmnet$bestTune$alpha
+best.lambda <- fit.glmnet$bestTune$lambda
+```
+
+So the tuned values that minimize the log loss are mixing percentage (alpha) = `r best.aplha` and regularization parameter (lambda) = `r round(best.lambda, digits=4)` which yeilds a very slight improvement over what we found earlier. We could spend more time tuning these further but the payoff probably won't be that great.
+
+## Check The Validation Set
+
+Now let's see what we get when we try to predict on the hold out set from earlier.
+
+```{r,warning=FALSE, message=FALSE}
+
+# Match our training set
+validation.set$Total.Volume.Donated..c.c.. <- NULL # remove correlated column
+
+# Redo the feature engineering
+validation.set <- validation.set %>% mutate(donations.per.month = Number.of.Donations/Months.since.First.Donation)
+validation.set <- validation.set %>% mutate(tenure.ratio = Months.since.Last.Donation/Months.since.First.Donation)
+
+# Recode the class labels to Yes/No (required when using class probs)
+required.labels <- validation.set['Class']
+recoded.labels <- recode(required.labels$Class, "0='No'; 1 = 'Yes'")
+validation.set$Class <- recoded.labels
+validation.set$Class  <-as.factor(validation.set$Class) # Make the class variable a factor
+set.seed(7)
+test.pred <- predict(fit.glmnet, newdata=validation.set[, c(2:4, 6:7)], type  = "prob")
+
+# Function to calculate logLoss
+LogLoss <- function(actual, predicted, eps=0.00001) {
+  predicted <- pmin(pmax(predicted, eps), 1-eps)
+  -1/length(actual)*(sum(actual*log(predicted)+(1-actual)*log(1-predicted)))
+}
+
+# In order to use the logLoss function we need to recode the class labels back to to 0 and 1
+required.labels <- validation.set['Class']
+recoded.labels <- recode(required.labels$Class, "'No'=0; 'Yes'=1")
+validation.set$Class <- recoded.labels
+
+# Now get logLoss on the validation set prediction
+ll <- LogLoss(as.numeric(as.character(validation.set$Class)), test.pred$Yes)
+```
+
+So the logLoss on this validation set is `r ll` which is pretty good for our purpose.
+
+
+## Making A Prediction on the Test Set
+
+Now we are ready to make our prediction on the test set and create a file to submit to Driven Data.
+
+```{r, warning=FALSE, message=FALSE}
+
+##### Predict on Test Set
+test.data <- read_csv("data/dd-test.csv")
+names(test.data) <- make.names(names(test.data))  # Make names more R friendly
+test.data$Total.Volume.Donated..c.c.. <- NULL # remove this column (corrolated with Months.since.Last.Donation)
+test.data <- test.data %>% mutate(donations.per.month = Number.of.Donations/Months.since.First.Donation)
+test.data <- test.data %>% mutate(tenure.ratio = Months.since.Last.Donation/Months.since.First.Donation)
+test.set <- test.data[,-1] # remove id column
+
+# Make predicitons
+set.seed(7)
+predictions <- predict(fit.glmnet, newdata=test.set, type  = "prob")
+pred.df <- as.data.frame(predictions$Yes)
+pred.df$id <- test.data$NA.
+pred.df <- pred.df[c(2,1)]
+
+# Prepare date for writing to csv using thre format from the submission format file
+submission_format <- read.csv("data/BloodDonationSubmissionFormat.csv", check.names=FALSE)
+colnames(pred.df) <- colnames(submission_format)
+write.csv(pred.df, file="submission4.csv", row.names=FALSE )
+
+```
+
+
+This gives a score of 0.4490 on Driven Data which yeilds a rank of 165 of about 1000 participents.
+
+![submission](figures/submission.jpg)
+
+Not bad. 
+
+***
+
+By the way, the workflow I have used here is based on a template from [Machine Learning Mastery](http://machinelearningmastery.com/) so you should check that site out for good information on starting in machine learning. 
+
+
+
+
